@@ -1,3 +1,7 @@
 streamlit
 openpyxl
+python-docx
+python-pptx
+pandas
 google-genai
+supabase
