@@ -1,13 +1,30 @@
+
 import io
 import re
+import hmac
+import secrets
+from datetime import datetime
+
+import pandas as pd
 import streamlit as st
 import openpyxl
+
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.text import PP_ALIGN
+
+from openpyxl.utils import column_index_from_string
 from google import genai
+from google.genai import types
+from supabase import create_client
 
 
-# =====================================================
-# CẤU HÌNH TRANG WEB
-# =====================================================
+# =========================================================
+# 1. CẤU HÌNH TRANG
+# =========================================================
 
 st.set_page_config(
     page_title="AI Smart Eval THCS",
@@ -15,313 +32,1706 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("📝 CHẤM BÀI THỰC HÀNH TIN HỌC")
-st.caption("Hệ thống hỗ trợ chấm bài thực hành Excel")
+st.markdown(
+    """
+    <style>
+    h1 {font-size: 2.15rem !important;}
+    @media (max-width: 600px) {
+        h1 {font-size: 1.7rem !important;}
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+st.title("📝 AI SMART EVAL THCS")
+st.caption(
+    "Chấm bài thực hành Excel • Word • PowerPoint "
+    "theo barem giáo viên tự tạo trên web"
+)
 
 
-# =====================================================
-# HÀM KIỂM TRA CÔNG THỨC
-# =====================================================
+# =========================================================
+# 2. SECRETS + DATABASE
+# =========================================================
 
-def co_ham(cong_thuc, ten_ham):
-    if not isinstance(cong_thuc, str):
-        return False
-
-    if not cong_thuc.startswith("="):
-        return False
-
-    mau = rf"\b{re.escape(ten_ham)}\s*\("
-
-    return re.search(
-        mau,
-        cong_thuc,
-        re.IGNORECASE
-    ) is not None
+def lay_secret(ten, mac_dinh=None):
+    try:
+        return st.secrets[ten]
+    except Exception:
+        return mac_dinh
 
 
-# =====================================================
-# HÀM KIỂM TRA VIỀN
-# =====================================================
-
-def co_du_vien(cell):
-    border = cell.border
-
-    if border is None:
-        return False
-
-    cac_canh = [
-        border.left,
-        border.right,
-        border.top,
-        border.bottom
-    ]
-
-    return all(
-        canh is not None
-        and canh.style is not None
-        for canh in cac_canh
-    )
+TEACHER_PIN = str(lay_secret("TEACHER_PIN", ""))
+GEMINI_API_KEY = str(lay_secret("GEMINI_API_KEY", ""))
+GEMINI_MODEL = str(lay_secret("GEMINI_MODEL", "gemini-3.8-flash"))
+SUPABASE_URL = str(lay_secret("SUPABASE_URL", ""))
+SUPABASE_KEY = str(lay_secret("SUPABASE_SERVICE_KEY", ""))
 
 
-# =====================================================
-# HÀM CHẤM BÀI EXCEL
-# =====================================================
+@st.cache_resource
+def ket_noi_supabase():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def cham_excel(file_bytes):
 
-    wb = openpyxl.load_workbook(
-        io.BytesIO(file_bytes),
-        data_only=False
-    )
+db = ket_noi_supabase()
 
-    sheet = wb.active
 
-    # ---------------------------------
-    # Xác định các hàng có dữ liệu
-    # ---------------------------------
+# =========================================================
+# 3. HÀM DATABASE
+# =========================================================
 
-    cac_hang = []
+def tao_ma_ngan():
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "AI-" + "".join(secrets.choice(alphabet) for _ in range(6))
 
-    for r in range(2, sheet.max_row + 1):
 
-        if sheet[f"A{r}"].value not in (None, ""):
-            cac_hang.append(r)
-
-    if not cac_hang:
+def tim_bai_theo_ma(ma_bai):
+    if db is None:
         return None
 
-    ket_qua = []
-
-    # =================================================
-    # TIÊU CHÍ 1
-    # Cột F dùng hàm AVERAGE - 4 điểm
-    # =================================================
-
-    dung_f = []
-    sai_f = []
-
-    for r in cac_hang:
-
-        dia_chi = f"F{r}"
-
-        if co_ham(
-            sheet[dia_chi].value,
-            "AVERAGE"
-        ):
-            dung_f.append(dia_chi)
-        else:
-            sai_f.append(dia_chi)
-
-    diem_f = (
-        len(dung_f)
-        / len(cac_hang)
-        * 4
+    r = (
+        db.table("assignments")
+        .select("*")
+        .eq("code", ma_bai.strip().upper())
+        .limit(1)
+        .execute()
     )
 
-    ket_qua.append({
-        "ten": "Cột F sử dụng hàm AVERAGE",
-        "diem": round(diem_f, 2),
-        "diem_max": 4,
-        "sai": sai_f
-    })
+    return r.data[0] if r.data else None
 
 
-    # =================================================
-    # TIÊU CHÍ 2
-    # Cột G dùng hàm IF - 4 điểm
-    # =================================================
+def tao_bai_moi(ten_bai, mo_ta, loai_file, barem):
+    if db is None:
+        raise ValueError("Chưa kết nối Supabase.")
 
-    dung_g = []
-    sai_g = []
+    for _ in range(30):
+        ma = tao_ma_ngan()
+        if tim_bai_theo_ma(ma) is None:
+            break
+    else:
+        raise ValueError("Không tạo được mã bài.")
 
-    for r in cac_hang:
+    rubric = {
+        "loai_file": loai_file,
+        **barem
+    }
 
-        dia_chi = f"G{r}"
-
-        if co_ham(
-            sheet[dia_chi].value,
-            "IF"
-        ):
-            dung_g.append(dia_chi)
-        else:
-            sai_g.append(dia_chi)
-
-    diem_g = (
-        len(dung_g)
-        / len(cac_hang)
-        * 4
+    r = (
+        db.table("assignments")
+        .insert({
+            "code": ma,
+            "title": ten_bai,
+            "description": mo_ta,
+            "rubric": rubric,
+            "active": True
+        })
+        .execute()
     )
 
-    ket_qua.append({
-        "ten": "Cột G sử dụng hàm IF",
-        "diem": round(diem_g, 2),
-        "diem_max": 4,
-        "sai": sai_g
-    })
+    if not r.data:
+        raise ValueError("Không lưu được bài tập.")
+
+    return ma
 
 
-    # =================================================
-    # TIÊU CHÍ 3
-    # Hàng tiêu đề A1:G1 in đậm - 1 điểm
-    # =================================================
+def lay_danh_sach_bai():
+    if db is None:
+        return []
 
-    dung_dam = 0
-    sai_dam = []
+    r = (
+        db.table("assignments")
+        .select("id,code,title,description,active,created_at,rubric")
+        .order("created_at", desc=True)
+        .execute()
+    )
 
-    for cot in range(1, 8):
+    return r.data or []
 
-        cell = sheet.cell(
-            row=1,
-            column=cot
+
+def cap_nhat_trang_thai_bai(ma_bai, active):
+    if db is None:
+        return
+
+    (
+        db.table("assignments")
+        .update({"active": bool(active)})
+        .eq("code", ma_bai)
+        .execute()
+    )
+
+
+def luu_ket_qua(ma_bai, ho_ten, lop, ten_file, ket_qua, nhan_xet):
+    if db is None:
+        return
+
+    (
+        db.table("submissions")
+        .insert({
+            "assignment_code": ma_bai,
+            "student_name": ho_ten,
+            "class_name": lop,
+            "file_name": ten_file,
+            "score": float(ket_qua["tong_diem"]),
+            "details": ket_qua,
+            "ai_feedback": nhan_xet
+        })
+        .execute()
+    )
+
+
+def lay_ket_qua_bai(ma_bai):
+    if db is None:
+        return []
+
+    r = (
+        db.table("submissions")
+        .select(
+            "id,assignment_code,student_name,class_name,"
+            "file_name,score,submitted_at"
         )
-
-        if bool(cell.font.bold):
-            dung_dam += 1
-        else:
-            sai_dam.append(
-                cell.coordinate
-            )
-
-    diem_dam = (
-        dung_dam / 7
+        .eq("assignment_code", ma_bai)
+        .order("submitted_at", desc=False)
+        .execute()
     )
 
-    ket_qua.append({
-        "ten": "Hàng tiêu đề in đậm",
-        "diem": round(diem_dam, 2),
-        "diem_max": 1,
-        "sai": sai_dam
-    })
+    return r.data or []
 
 
-    # =================================================
-    # TIÊU CHÍ 4
-    # Bảng A1:G... có viền - 1 điểm
-    # =================================================
+# =========================================================
+# 4. HÀM CHUNG CHẤM ĐIỂM
+# =========================================================
 
-    hang_cuoi = max(cac_hang)
+def ket_qua_tieu_chi(tc, dung, sai):
+    tong = len(dung) + len(sai)
 
-    tong_o = 0
-    so_o_dung = 0
-    sai_vien = []
+    if tong == 0:
+        diem = 0
+    else:
+        diem = len(dung) / tong * float(tc["diem"])
 
-    for r in range(1, hang_cuoi + 1):
+    return {
+        "mo_ta": tc["mo_ta"],
+        "loai": tc["loai"],
+        "diem": round(diem, 2),
+        "diem_toi_da": float(tc["diem"]),
+        "so_dung": len(dung),
+        "tong": tong,
+        "sai": sai
+    }
 
-        for c in range(1, 8):
 
-            cell = sheet.cell(
-                row=r,
-                column=c
-            )
+def ket_qua_dat_khong(tc, dat, chi_tiet_dung="", chi_tiet_sai=""):
+    return {
+        "mo_ta": tc["mo_ta"],
+        "loai": tc["loai"],
+        "diem": float(tc["diem"]) if dat else 0,
+        "diem_toi_da": float(tc["diem"]),
+        "so_dung": 1 if dat else 0,
+        "tong": 1,
+        "sai": [] if dat else [chi_tiet_sai or "Chưa đạt"],
+        "ghi_chu": chi_tiet_dung if dat else chi_tiet_sai
+    }
 
-            tong_o += 1
 
-            if co_du_vien(cell):
-                so_o_dung += 1
-            else:
-                sai_vien.append(
-                    cell.coordinate
+# =========================================================
+# 5. EXCEL
+# =========================================================
+
+def chuan_hoa_cong_thuc(x):
+    if not isinstance(x, str):
+        return ""
+
+    x = x.replace("$", "").replace(";", ",")
+    return re.sub(r"\s+", "", x).upper()
+
+
+def co_du_4_vien(cell):
+    b = cell.border
+    if b is None:
+        return False
+
+    canh = [b.left, b.right, b.top, b.bottom]
+
+    return all(
+        x is not None and x.style is not None
+        for x in canh
+    )
+
+
+def tim_hang_excel(sheet, barem):
+    cot = barem["cot_moc"]
+    start = int(barem["hang_bat_dau"])
+
+    return [
+        r
+        for r in range(start, sheet.max_row + 1)
+        if sheet[f"{cot}{r}"].value not in (None, "")
+    ]
+
+
+def cham_excel(file_bytes, barem):
+    try:
+        wb = openpyxl.load_workbook(
+            io.BytesIO(file_bytes),
+            data_only=False
+        )
+    except Exception as e:
+        return {"loi": f"Không đọc được Excel: {e}"}
+
+    ten_sheet = barem.get("ten_sheet", "").strip()
+
+    if ten_sheet:
+        if ten_sheet not in wb.sheetnames:
+            return {"loi": f"Không tìm thấy sheet '{ten_sheet}'."}
+        sh = wb[ten_sheet]
+    else:
+        sh = wb.active
+
+    hang_dl = tim_hang_excel(sh, barem)
+
+    if not hang_dl:
+        return {"loi": "Không xác định được hàng dữ liệu."}
+
+    kq = []
+
+    for tc in barem["tieu_chi"]:
+        loai = tc["loai"]
+        dung, sai = [], []
+
+        if loai == "HAM_VUNG":
+            for r in hang_dl:
+                o = f"{tc['cot_ket_qua']}{r}"
+
+                thuc = chuan_hoa_cong_thuc(
+                    sh[o].value
                 )
 
-    diem_vien = (
-        so_o_dung
-        / tong_o
-    )
+                mong = chuan_hoa_cong_thuc(
+                    f"={tc['ten_ham']}("
+                    f"{tc['cot_dau']}{r}:"
+                    f"{tc['cot_cuoi']}{r})"
+                )
 
-    ket_qua.append({
-        "ten": "Bảng được kẻ viền",
-        "diem": round(diem_vien, 2),
-        "diem_max": 1,
-        "sai": sai_vien[:20]
-    })
+                if thuc == mong:
+                    dung.append(o)
+                else:
+                    sai.append({
+                        "o": o,
+                        "hien_tai": sh[o].value
+                    })
 
+        elif loai == "CONG_THUC_MAU":
+            for r in hang_dl:
+                o = f"{tc['cot_ket_qua']}{r}"
 
-    # =================================================
-    # TỔNG ĐIỂM
-    # =================================================
+                thuc = chuan_hoa_cong_thuc(
+                    sh[o].value
+                )
 
-    tong_diem = round(
-        sum(
-            tc["diem"]
-            for tc in ket_qua
-        ),
+                mong = chuan_hoa_cong_thuc(
+                    tc["cong_thuc_mau"].replace(
+                        "{r}",
+                        str(r)
+                    )
+                )
+
+                if thuc == mong:
+                    dung.append(o)
+                else:
+                    sai.append({
+                        "o": o,
+                        "hien_tai": sh[o].value
+                    })
+
+        elif loai == "IN_DAM_HANG":
+            c1 = column_index_from_string(tc["cot_dau"])
+            c2 = column_index_from_string(tc["cot_cuoi"])
+
+            for c in range(c1, c2 + 1):
+                cell = sh.cell(int(tc["hang"]), c)
+
+                if cell.value in (None, ""):
+                    continue
+
+                if bool(cell.font.bold):
+                    dung.append(cell.coordinate)
+                else:
+                    sai.append(cell.coordinate)
+
+        elif loai == "VIEN_BANG":
+            c1 = column_index_from_string(tc["cot_dau"])
+            c2 = column_index_from_string(tc["cot_cuoi"])
+            h2 = max(hang_dl)
+
+            for r in range(int(tc["hang"]), h2 + 1):
+                for c in range(c1, c2 + 1):
+                    cell = sh.cell(r, c)
+
+                    if co_du_4_vien(cell):
+                        dung.append(cell.coordinate)
+                    else:
+                        sai.append(cell.coordinate)
+
+            sai = sai[:50]
+
+        elif loai == "CAN_LE_HANG":
+            c1 = column_index_from_string(tc["cot_dau"])
+            c2 = column_index_from_string(tc["cot_cuoi"])
+            can_dung = tc["can_le"].lower()
+
+            for c in range(c1, c2 + 1):
+                cell = sh.cell(int(tc["hang"]), c)
+
+                if cell.value in (None, ""):
+                    continue
+
+                can = (
+                    cell.alignment.horizontal or ""
+                ).lower()
+
+                if can == can_dung:
+                    dung.append(cell.coordinate)
+                else:
+                    sai.append(cell.coordinate)
+
+        elif loai == "DINH_DANG_SO":
+            for r in hang_dl:
+                cell = sh[f"{tc['cot_ket_qua']}{r}"]
+
+                if (
+                    str(cell.number_format).strip()
+                    == tc["dinh_dang_so"].strip()
+                ):
+                    dung.append(cell.coordinate)
+                else:
+                    sai.append(cell.coordinate)
+
+        else:
+            continue
+
+        kq.append(
+            ket_qua_tieu_chi(
+                tc,
+                dung,
+                sai
+            )
+        )
+
+    tong = round(
+        sum(x["diem"] for x in kq),
         2
     )
 
     return {
-        "tong_diem": tong_diem,
-        "chi_tiet": ket_qua
+        "loai_file": "Excel",
+        "ten_bai": barem["ten_bai"],
+        "tong_diem": min(tong, 10),
+        "chi_tiet": kq
     }
 
 
-# =====================================================
-# GIAO DIỆN HỌC SINH
-# =====================================================
+# =========================================================
+# 6. WORD
+# =========================================================
 
-st.subheader("🎓 Nộp bài")
+def tat_ca_doan_word(doc):
+    ket_qua = []
 
-ho_ten = st.text_input(
-    "Họ và tên học sinh"
-)
+    for i, p in enumerate(doc.paragraphs, 1):
+        if p.text.strip():
+            ket_qua.append(
+                (f"Đoạn {i}", p)
+            )
 
-lop = st.text_input(
-    "Lớp",
-    placeholder="Ví dụ: 7A1"
-)
+    for ti, table in enumerate(doc.tables, 1):
+        for ri, row in enumerate(table.rows, 1):
+            for ci, cell in enumerate(row.cells, 1):
+                for pi, p in enumerate(cell.paragraphs, 1):
+                    if p.text.strip():
+                        ket_qua.append(
+                            (
+                                f"Bảng {ti} "
+                                f"ô[{ri},{ci}] "
+                                f"đoạn {pi}",
+                                p
+                            )
+                        )
 
-file_nop = st.file_uploader(
-    "Chọn bài thực hành Excel",
-    type=["xlsx"]
-)
+    return ket_qua
 
 
-# =====================================================
-# CHẤM BÀI
-# =====================================================
+def can_le_word(paragraph):
+    a = paragraph.alignment
 
-if st.button(
-    "🚀 Nộp bài và chấm điểm",
-    type="primary"
+    if a is None:
+        return "default"
+
+    mapping = {
+        WD_ALIGN_PARAGRAPH.LEFT: "left",
+        WD_ALIGN_PARAGRAPH.CENTER: "center",
+        WD_ALIGN_PARAGRAPH.RIGHT: "right",
+        WD_ALIGN_PARAGRAPH.JUSTIFY: "justify"
+    }
+
+    return mapping.get(
+        a,
+        str(a).lower()
+    )
+
+
+def run_co_font(run, ten_font):
+    if run.font.name:
+        return (
+            run.font.name.lower()
+            == ten_font.lower()
+        )
+
+    return False
+
+
+def run_co_size(run, co_chu):
+    if run.font.size is None:
+        return False
+
+    return abs(
+        run.font.size.pt
+        - float(co_chu)
+    ) < 0.2
+
+
+def cham_word(file_bytes, barem):
+    try:
+        doc = Document(
+            io.BytesIO(file_bytes)
+        )
+    except Exception as e:
+        return {
+            "loi":
+                f"Không đọc được Word: {e}"
+        }
+
+    ds_doan = tat_ca_doan_word(doc)
+    kq = []
+
+    for tc in barem["tieu_chi"]:
+        loai = tc["loai"]
+        dung, sai = [], []
+
+        if loai == "CO_NOI_DUNG":
+            noi_dung = "\n".join(
+                p.text
+                for _, p in ds_doan
+            ).lower()
+
+            tu_khoa = [
+                x.strip()
+                for x in tc["gia_tri"].split("|")
+                if x.strip()
+            ]
+
+            for x in tu_khoa:
+                if x.lower() in noi_dung:
+                    dung.append(x)
+                else:
+                    sai.append(x)
+
+        elif loai == "SO_DOAN_TOI_THIEU":
+            so = len([
+                p
+                for p in doc.paragraphs
+                if p.text.strip()
+            ])
+
+            dat = so >= int(tc["gia_tri"])
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có {so} đoạn.",
+                    f"Hiện có {so} đoạn."
+                )
+            )
+            continue
+
+        elif loai == "SO_BANG_TOI_THIEU":
+            so = len(doc.tables)
+            dat = so >= int(tc["gia_tri"])
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có {so} bảng.",
+                    f"Hiện có {so} bảng."
+                )
+            )
+            continue
+
+        elif loai in (
+            "IN_DAM",
+            "IN_NGHIENG",
+            "FONT",
+            "CO_CHU",
+            "CAN_LE"
+        ):
+            for ten, p in ds_doan:
+                if loai == "CAN_LE":
+                    ok = (
+                        can_le_word(p)
+                        == tc["gia_tri"].lower()
+                    )
+                else:
+                    runs = [
+                        r
+                        for r in p.runs
+                        if r.text.strip()
+                    ]
+
+                    if loai == "IN_DAM":
+                        ok = bool(runs) and all(
+                            bool(r.bold)
+                            for r in runs
+                        )
+
+                    elif loai == "IN_NGHIENG":
+                        ok = bool(runs) and all(
+                            bool(r.italic)
+                            for r in runs
+                        )
+
+                    elif loai == "FONT":
+                        ok = bool(runs) and all(
+                            run_co_font(
+                                r,
+                                tc["gia_tri"]
+                            )
+                            for r in runs
+                        )
+
+                    elif loai == "CO_CHU":
+                        ok = bool(runs) and all(
+                            run_co_size(
+                                r,
+                                tc["gia_tri"]
+                            )
+                            for r in runs
+                        )
+
+                if ok:
+                    dung.append(ten)
+                else:
+                    sai.append(ten)
+
+        elif loai == "GIAN_DONG":
+            for ten, p in ds_doan:
+                val = (
+                    p.paragraph_format
+                    .line_spacing
+                )
+
+                ok = False
+
+                if val is not None:
+                    try:
+                        ok = abs(
+                            float(val)
+                            - float(tc["gia_tri"])
+                        ) < 0.05
+                    except Exception:
+                        ok = False
+
+                if ok:
+                    dung.append(ten)
+                else:
+                    sai.append(ten)
+
+        elif loai == "LE_TRANG":
+            try:
+                trai, phai, tren, duoi = [
+                    float(x.strip())
+                    for x
+                    in tc["gia_tri"].split(",")
+                ]
+            except Exception:
+                return {
+                    "loi":
+                        "Lề trang phải nhập "
+                        "dạng 3,2,2,2"
+                }
+
+            for i, sec in enumerate(
+                doc.sections,
+                1
+            ):
+                vals = [
+                    sec.left_margin.cm,
+                    sec.right_margin.cm,
+                    sec.top_margin.cm,
+                    sec.bottom_margin.cm
+                ]
+
+                muc_tieu = [
+                    trai,
+                    phai,
+                    tren,
+                    duoi
+                ]
+
+                ok = all(
+                    abs(a - b) < 0.15
+                    for a, b
+                    in zip(vals, muc_tieu)
+                )
+
+                if ok:
+                    dung.append(
+                        f"Section {i}"
+                    )
+                else:
+                    sai.append(
+                        f"Section {i}"
+                    )
+
+        else:
+            continue
+
+        kq.append(
+            ket_qua_tieu_chi(
+                tc,
+                dung,
+                sai[:50]
+            )
+        )
+
+    tong = round(
+        sum(x["diem"] for x in kq),
+        2
+    )
+
+    return {
+        "loai_file": "Word",
+        "ten_bai": barem["ten_bai"],
+        "tong_diem": min(tong, 10),
+        "chi_tiet": kq
+    }
+
+
+# =========================================================
+# 7. POWERPOINT - HÀM ĐỌC
+# =========================================================
+
+def ppt_tat_ca_shapes(shapes, prefix=""):
+    """
+    Trả về toàn bộ shape, kể cả shape trong group.
+    """
+    ket_qua = []
+
+    for shape in shapes:
+        ten = getattr(
+            shape,
+            "name",
+            "Không tên"
+        )
+
+        path = (
+            f"{prefix}/{ten}"
+            if prefix
+            else ten
+        )
+
+        if (
+            shape.shape_type
+            == MSO_SHAPE_TYPE.GROUP
+        ):
+            ket_qua.extend(
+                ppt_tat_ca_shapes(
+                    shape.shapes,
+                    path
+                )
+            )
+        else:
+            ket_qua.append(
+                (path, shape)
+            )
+
+    return ket_qua
+
+
+def ppt_tat_ca_text_runs(prs):
+    """
+    Trả về (vị trí, paragraph, run) trên toàn bộ slide.
+    """
+    ket_qua = []
+
+    for si, slide in enumerate(
+        prs.slides,
+        1
+    ):
+        for path, shape in ppt_tat_ca_shapes(
+            slide.shapes
+        ):
+            if getattr(
+                shape,
+                "has_text_frame",
+                False
+            ):
+                for pi, p in enumerate(
+                    shape.text_frame.paragraphs,
+                    1
+                ):
+                    for ri, run in enumerate(
+                        p.runs,
+                        1
+                    ):
+                        if run.text.strip():
+                            ket_qua.append(
+                                (
+                                    f"Slide {si} "
+                                    f"{path} "
+                                    f"đoạn {pi} "
+                                    f"run {ri}",
+                                    p,
+                                    run
+                                )
+                            )
+
+            if getattr(
+                shape,
+                "has_table",
+                False
+            ):
+                for rowi, row in enumerate(
+                    shape.table.rows,
+                    1
+                ):
+                    for coli, cell in enumerate(
+                        row.cells,
+                        1
+                    ):
+                        for pi, p in enumerate(
+                            cell.text_frame.paragraphs,
+                            1
+                        ):
+                            for ri, run in enumerate(
+                                p.runs,
+                                1
+                            ):
+                                if run.text.strip():
+                                    ket_qua.append(
+                                        (
+                                            f"Slide {si} "
+                                            f"bảng {path} "
+                                            f"ô[{rowi},{coli}] "
+                                            f"đoạn {pi} "
+                                            f"run {ri}",
+                                            p,
+                                            run
+                                        )
+                                    )
+
+    return ket_qua
+
+
+def ppt_noi_dung_toan_bo(prs):
+    parts = []
+
+    for slide in prs.slides:
+        for _, shape in ppt_tat_ca_shapes(
+            slide.shapes
+        ):
+            if getattr(
+                shape,
+                "has_text_frame",
+                False
+            ):
+                txt = shape.text.strip()
+                if txt:
+                    parts.append(txt)
+
+            if getattr(
+                shape,
+                "has_table",
+                False
+            ):
+                for row in shape.table.rows:
+                    for cell in row.cells:
+                        txt = cell.text.strip()
+                        if txt:
+                            parts.append(txt)
+
+    return "\n".join(parts)
+
+
+def ppt_dem_anh(prs):
+    dem = 0
+
+    for slide in prs.slides:
+        for _, shape in ppt_tat_ca_shapes(
+            slide.shapes
+        ):
+            if (
+                shape.shape_type
+                == MSO_SHAPE_TYPE.PICTURE
+            ):
+                dem += 1
+
+    return dem
+
+
+def ppt_dem_bang(prs):
+    dem = 0
+
+    for slide in prs.slides:
+        for _, shape in ppt_tat_ca_shapes(
+            slide.shapes
+        ):
+            if getattr(
+                shape,
+                "has_table",
+                False
+            ):
+                dem += 1
+
+    return dem
+
+
+def ppt_so_slide_co_tieu_de(prs):
+    dung = []
+    sai = []
+
+    for i, slide in enumerate(
+        prs.slides,
+        1
+    ):
+        title = slide.shapes.title
+
+        if (
+            title is not None
+            and getattr(
+                title,
+                "has_text_frame",
+                False
+            )
+            and title.text.strip()
+        ):
+            dung.append(
+                f"Slide {i}"
+            )
+        else:
+            sai.append(
+                f"Slide {i}"
+            )
+
+    return dung, sai
+
+
+def ppt_can_le(paragraph):
+    a = paragraph.alignment
+
+    if a is None:
+        return "default"
+
+    mapping = {
+        PP_ALIGN.LEFT: "left",
+        PP_ALIGN.CENTER: "center",
+        PP_ALIGN.RIGHT: "right",
+        PP_ALIGN.JUSTIFY: "justify"
+    }
+
+    return mapping.get(
+        a,
+        str(a).lower()
+    )
+
+
+# =========================================================
+# 8. POWERPOINT - CHẤM
+# =========================================================
+
+def cham_powerpoint(file_bytes, barem):
+    try:
+        prs = Presentation(
+            io.BytesIO(file_bytes)
+        )
+    except Exception as e:
+        return {
+            "loi":
+                f"Không đọc được PowerPoint: {e}"
+        }
+
+    kq = []
+    all_runs = ppt_tat_ca_text_runs(prs)
+
+    for tc in barem["tieu_chi"]:
+        loai = tc["loai"]
+
+        if loai == "SO_SLIDE_TOI_THIEU":
+            so = len(prs.slides)
+            dat = so >= int(tc["gia_tri"])
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có {so} slide.",
+                    f"Hiện có {so} slide."
+                )
+            )
+            continue
+
+        elif loai == "CO_NOI_DUNG":
+            noi_dung = (
+                ppt_noi_dung_toan_bo(prs)
+                .lower()
+            )
+
+            tu_khoa = [
+                x.strip()
+                for x in tc["gia_tri"].split("|")
+                if x.strip()
+            ]
+
+            dung = []
+            sai = []
+
+            for x in tu_khoa:
+                if x.lower() in noi_dung:
+                    dung.append(x)
+                else:
+                    sai.append(x)
+
+            kq.append(
+                ket_qua_tieu_chi(
+                    tc,
+                    dung,
+                    sai
+                )
+            )
+            continue
+
+        elif loai == "TIEU_DE_SLIDE":
+            dung, sai = (
+                ppt_so_slide_co_tieu_de(prs)
+            )
+
+            kq.append(
+                ket_qua_tieu_chi(
+                    tc,
+                    dung,
+                    sai
+                )
+            )
+            continue
+
+        elif loai == "SO_ANH_TOI_THIEU":
+            so = ppt_dem_anh(prs)
+            dat = so >= int(tc["gia_tri"])
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có {so} hình ảnh.",
+                    f"Hiện có {so} hình ảnh."
+                )
+            )
+            continue
+
+        elif loai == "SO_BANG_TOI_THIEU":
+            so = ppt_dem_bang(prs)
+            dat = so >= int(tc["gia_tri"])
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có {so} bảng.",
+                    f"Hiện có {so} bảng."
+                )
+            )
+            continue
+
+        elif loai in (
+            "FONT",
+            "CO_CHU",
+            "IN_DAM",
+            "IN_NGHIENG",
+            "CAN_LE"
+        ):
+            dung = []
+            sai = []
+
+            for vi_tri, p, run in all_runs:
+                if loai == "FONT":
+                    ok = (
+                        run.font.name is not None
+                        and run.font.name.lower()
+                        == tc["gia_tri"].lower()
+                    )
+
+                elif loai == "CO_CHU":
+                    ok = (
+                        run.font.size is not None
+                        and abs(
+                            run.font.size.pt
+                            - float(tc["gia_tri"])
+                        ) < 0.2
+                    )
+
+                elif loai == "IN_DAM":
+                    ok = bool(
+                        run.font.bold
+                    )
+
+                elif loai == "IN_NGHIENG":
+                    ok = bool(
+                        run.font.italic
+                    )
+
+                elif loai == "CAN_LE":
+                    ok = (
+                        ppt_can_le(p)
+                        == tc["gia_tri"].lower()
+                    )
+
+                if ok:
+                    dung.append(vi_tri)
+                else:
+                    sai.append(vi_tri)
+
+            kq.append(
+                ket_qua_tieu_chi(
+                    tc,
+                    dung,
+                    sai[:50]
+                )
+            )
+            continue
+
+    tong = round(
+        sum(x["diem"] for x in kq),
+        2
+    )
+
+    return {
+        "loai_file": "PowerPoint",
+        "ten_bai": barem["ten_bai"],
+        "tong_diem": min(tong, 10),
+        "chi_tiet": kq
+    }
+
+
+# =========================================================
+# 9. GEMINI NHẬN XÉT
+# =========================================================
+
+def tao_du_lieu_ai(ket_qua):
+    dong = [
+        f"Tên bài: {ket_qua['ten_bai']}",
+        f"Loại bài: {ket_qua['loai_file']}",
+        f"Điểm chính thức: {ket_qua['tong_diem']}/10"
+    ]
+
+    for tc in ket_qua["chi_tiet"]:
+        dong.append(
+            f"\n- {tc['mo_ta']}: "
+            f"{tc['diem']}/"
+            f"{tc['diem_toi_da']} điểm"
+        )
+
+        if tc["sai"]:
+            loi = []
+
+            for x in tc["sai"][:10]:
+                if isinstance(x, dict):
+                    loi.append(
+                        str(x.get("o", x))
+                    )
+                else:
+                    loi.append(str(x))
+
+            dong.append(
+                "Cần xem lại: "
+                + ", ".join(loi)
+            )
+
+    return "\n".join(dong)
+
+
+def tao_nhan_xet_ai(
+    ho_ten,
+    lop,
+    ket_qua
 ):
+    if not GEMINI_API_KEY:
+        return ""
 
-    if not ho_ten.strip():
-
-        st.warning(
-            "Em hãy nhập họ và tên."
+    try:
+        client = genai.Client(
+            api_key=GEMINI_API_KEY
         )
 
-    elif not lop.strip():
+        prompt = f"""
+Bạn là giáo viên Tin học THCS Việt Nam.
 
-        st.warning(
-            "Em hãy nhập lớp."
+Học sinh: {ho_ten}
+Lớp: {lop}
+
+Kết quả chấm chính thức do Python xác định:
+{tao_du_lieu_ai(ket_qua)}
+
+QUY TẮC:
+1. Tuyệt đối không thay đổi điểm.
+2. Không tự chấm lại.
+3. Không giải hộ bài.
+4. Không viết sẵn công thức/đáp án hoàn chỉnh.
+5. Chỉ rõ vị trí hoặc nội dung cần xem lại.
+6. Đặt câu hỏi gợi mở kiểu Socratic.
+7. Giọng văn khích lệ, chuẩn mực, ngắn gọn.
+
+Trình bày:
+🌟 **Điểm làm tốt**
+🔍 **Nội dung cần xem lại**
+💡 **Câu hỏi gợi mở**
+🎯 **Điểm chính thức:** {ket_qua['tong_diem']}/10
+"""
+
+        r = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2
+            )
         )
 
-    elif file_nop is None:
+        return r.text or ""
 
-        st.warning(
-            "Em hãy chọn file bài làm."
+    except Exception:
+        return ""
+
+
+# =========================================================
+# 10. TẠO BAREM TỪ WEB
+# =========================================================
+
+def clean(v):
+    if pd.isna(v):
+        return None
+
+    if (
+        isinstance(v, float)
+        and v.is_integer()
+    ):
+        return int(v)
+
+    return v
+
+
+def kiem_tra_tong_diem(tieu_chi):
+    tong = sum(
+        float(x["diem"])
+        for x in tieu_chi
+    )
+
+    if abs(tong - 10) > 0.001:
+        raise ValueError(
+            f"Tổng điểm phải bằng 10. "
+            f"Hiện tại: {tong:g}"
         )
 
-    else:
 
-        try:
+def tao_barem_excel(
+    ten_bai,
+    ten_sheet,
+    cot_moc,
+    hang_bat_dau,
+    df
+):
+    tieu_chi = []
 
-            file_bytes = (
-                file_nop.getvalue()
+    for row in df.to_dict(
+        orient="records"
+    ):
+        row = {
+            k: clean(v)
+            for k, v in row.items()
+        }
+
+        loai = row.get("loai")
+        mo_ta = row.get("mo_ta")
+        diem = float(
+            row.get("diem") or 0
+        )
+
+        if not loai or not mo_ta or diem <= 0:
+            continue
+
+        tc = {
+            "loai": str(loai),
+            "mo_ta": str(mo_ta),
+            "diem": diem
+        }
+
+        if loai == "HAM_VUNG":
+            tc.update({
+                "cot_ket_qua":
+                    str(
+                        row.get(
+                            "cot_ket_qua"
+                        ) or ""
+                    ).upper(),
+
+                "ten_ham":
+                    str(
+                        row.get(
+                            "ten_ham"
+                        ) or ""
+                    ).upper(),
+
+                "cot_dau":
+                    str(
+                        row.get(
+                            "cot_dau"
+                        ) or ""
+                    ).upper(),
+
+                "cot_cuoi":
+                    str(
+                        row.get(
+                            "cot_cuoi"
+                        ) or ""
+                    ).upper()
+            })
+
+        elif loai == "CONG_THUC_MAU":
+            tc.update({
+                "cot_ket_qua":
+                    str(
+                        row.get(
+                            "cot_ket_qua"
+                        ) or ""
+                    ).upper(),
+
+                "cong_thuc_mau":
+                    str(
+                        row.get(
+                            "cong_thuc_mau"
+                        ) or ""
+                    )
+            })
+
+        elif loai in (
+            "IN_DAM_HANG",
+            "VIEN_BANG",
+            "CAN_LE_HANG"
+        ):
+            tc.update({
+                "hang":
+                    int(
+                        row.get("hang")
+                        or 1
+                    ),
+
+                "cot_dau":
+                    str(
+                        row.get(
+                            "cot_dau"
+                        ) or "A"
+                    ).upper(),
+
+                "cot_cuoi":
+                    str(
+                        row.get(
+                            "cot_cuoi"
+                        ) or "A"
+                    ).upper()
+            })
+
+            if loai == "CAN_LE_HANG":
+                tc["can_le"] = str(
+                    row.get("can_le")
+                    or "center"
+                ).lower()
+
+        elif loai == "DINH_DANG_SO":
+            tc.update({
+                "cot_ket_qua":
+                    str(
+                        row.get(
+                            "cot_ket_qua"
+                        ) or ""
+                    ).upper(),
+
+                "dinh_dang_so":
+                    str(
+                        row.get(
+                            "dinh_dang_so"
+                        ) or ""
+                    )
+            })
+
+        tieu_chi.append(tc)
+
+    kiem_tra_tong_diem(
+        tieu_chi
+    )
+
+    return {
+        "ten_bai": ten_bai,
+        "ten_sheet": ten_sheet,
+        "cot_moc": cot_moc.upper(),
+        "hang_bat_dau": int(
+            hang_bat_dau
+        ),
+        "tieu_chi": tieu_chi
+    }
+
+
+def tao_barem_dang_gia_tri(
+    ten_bai,
+    df
+):
+    tieu_chi = []
+
+    for row in df.to_dict(
+        orient="records"
+    ):
+        row = {
+            k: clean(v)
+            for k, v in row.items()
+        }
+
+        loai = row.get("loai")
+        mo_ta = row.get("mo_ta")
+        diem = float(
+            row.get("diem") or 0
+        )
+
+        if not loai or not mo_ta or diem <= 0:
+            continue
+
+        tieu_chi.append({
+            "loai": str(loai),
+            "mo_ta": str(mo_ta),
+            "diem": diem,
+            "gia_tri":
+                str(
+                    row.get(
+                        "gia_tri"
+                    ) or ""
+                ).strip()
+        })
+
+    kiem_tra_tong_diem(
+        tieu_chi
+    )
+
+    return {
+        "ten_bai": ten_bai,
+        "tieu_chi": tieu_chi
+    }
+
+
+# =========================================================
+# 11. XUẤT EXCEL KẾT QUẢ
+# =========================================================
+
+def tao_file_excel_ket_qua(ds):
+    if not ds:
+        return None
+
+    df = pd.DataFrame(ds)
+
+    df = df.rename(
+        columns={
+            "student_name":
+                "Họ và tên",
+            "class_name":
+                "Lớp",
+            "score":
+                "Điểm",
+            "file_name":
+                "Tên file",
+            "submitted_at":
+                "Thời gian nộp"
+        }
+    )
+
+    cols = [
+        c
+        for c in [
+            "Họ và tên",
+            "Lớp",
+            "Điểm",
+            "Tên file",
+            "Thời gian nộp"
+        ]
+        if c in df.columns
+    ]
+
+    df = df[cols]
+
+    out = io.BytesIO()
+
+    with pd.ExcelWriter(
+        out,
+        engine="openpyxl"
+    ) as writer:
+        df.to_excel(
+            writer,
+            index=False,
+            sheet_name="Ket_qua"
+        )
+
+        ws = writer.book[
+            "Ket_qua"
+        ]
+
+        for cell in ws[1]:
+            cell.font = (
+                openpyxl.styles
+                .Font(bold=True)
             )
 
-            ket_qua = cham_excel(
-                file_bytes
+        for col in ws.columns:
+            width = min(
+                max(
+                    len(
+                        str(
+                            c.value or ""
+                        )
+                    )
+                    for c in col
+                ) + 2,
+                35
             )
 
-            if ket_qua is None:
+            ws.column_dimensions[
+                col[0].column_letter
+            ].width = width
 
-                st.error(
-                    "Không tìm thấy dữ liệu "
-                    "để chấm."
+    out.seek(0)
+    return out.getvalue()
+
+
+# =========================================================
+# 12. KIỂM TRA CẤU HÌNH
+# =========================================================
+
+thieu = []
+
+if not TEACHER_PIN:
+    thieu.append("TEACHER_PIN")
+
+if not SUPABASE_URL:
+    thieu.append("SUPABASE_URL")
+
+if not SUPABASE_KEY:
+    thieu.append(
+        "SUPABASE_SERVICE_KEY"
+    )
+
+if thieu:
+    st.warning(
+        "Thiếu cấu hình: "
+        + ", ".join(thieu)
+    )
+
+
+# =========================================================
+# 13. GIAO DIỆN CHÍNH
+# =========================================================
+
+tab_hs, tab_gv = st.tabs([
+    "🎓 HỌC SINH",
+    "👩‍🏫 GIÁO VIÊN"
+])
+
+
+# =========================================================
+# 14. HỌC SINH
+# =========================================================
+
+with tab_hs:
+    st.subheader(
+        "🎓 Nộp bài"
+    )
+
+    ma_bai = st.text_input(
+        "Mã bài",
+        placeholder="Ví dụ: AI-7K4P9Q"
+    )
+
+    ho_ten = st.text_input(
+        "Họ và tên"
+    )
+
+    lop = st.text_input(
+        "Lớp",
+        placeholder="Ví dụ: 7A1"
+    )
+
+    bai = None
+    file_nop = None
+
+    if (
+        ma_bai.strip()
+        and db is not None
+    ):
+        bai = tim_bai_theo_ma(
+            ma_bai.strip().upper()
+        )
+
+        if bai:
+            loai_file = (
+                bai["rubric"]
+                .get(
+                    "loai_file",
+                    "Excel"
+                )
+            )
+
+            st.info(
+                f"📘 {bai['title']} — "
+                f"Loại bài: {loai_file}"
+            )
+
+            if loai_file == "Word":
+                file_nop = (
+                    st.file_uploader(
+                        "Chọn file Word",
+                        type=["docx"]
+                    )
+                )
+
+            elif loai_file == "PowerPoint":
+                file_nop = (
+                    st.file_uploader(
+                        "Chọn file PowerPoint",
+                        type=["pptx"]
+                    )
                 )
 
             else:
+                file_nop = (
+                    st.file_uploader(
+                        "Chọn file Excel",
+                        type=["xlsx"]
+                    )
+                )
+
+    if st.button(
+        "🚀 Nộp bài và chấm điểm",
+        type="primary",
+        use_container_width=True
+    ):
+        if db is None:
+            st.error(
+                "Chưa kết nối cơ sở dữ liệu."
+            )
+
+        elif not ma_bai.strip():
+            st.warning(
+                "Em hãy nhập mã bài."
+            )
+
+        elif not bai:
+            st.error(
+                "Không tìm thấy mã bài."
+            )
+
+        elif not bai["active"]:
+            st.warning(
+                "Bài này đã đóng nhận bài."
+            )
+
+        elif not ho_ten.strip():
+            st.warning(
+                "Em hãy nhập họ và tên."
+            )
+
+        elif not lop.strip():
+            st.warning(
+                "Em hãy nhập lớp."
+            )
+
+        elif file_nop is None:
+            st.warning(
+                "Em hãy chọn file bài làm."
+            )
+
+        else:
+            barem = bai["rubric"]
+            loai_file = barem.get(
+                "loai_file",
+                "Excel"
+            )
+
+            with st.spinner(
+                "Đang chấm bài..."
+            ):
+                if loai_file == "Word":
+                    ket_qua = cham_word(
+                        file_nop.getvalue(),
+                        barem
+                    )
+
+                elif loai_file == "PowerPoint":
+                    ket_qua = (
+                        cham_powerpoint(
+                            file_nop.getvalue(),
+                            barem
+                        )
+                    )
+
+                else:
+                    ket_qua = cham_excel(
+                        file_nop.getvalue(),
+                        barem
+                    )
+
+            if "loi" in ket_qua:
+                st.error(
+                    ket_qua["loi"]
+                )
+
+            else:
+                with st.spinner(
+                    "Đang tạo nhận xét..."
+                ):
+                    nhan_xet = (
+                        tao_nhan_xet_ai(
+                            ho_ten,
+                            lop,
+                            ket_qua
+                        )
+                    )
+
+                try:
+                    luu_ket_qua(
+                        ma_bai
+                        .strip()
+                        .upper(),
+
+                        ho_ten.strip(),
+                        lop.strip(),
+                        file_nop.name,
+                        ket_qua,
+                        nhan_xet
+                    )
+
+                except Exception as e:
+                    st.warning(
+                        "Đã chấm nhưng "
+                        "chưa lưu được kết quả."
+                    )
+                    st.caption(
+                        str(e)
+                    )
 
                 st.success(
                     "✅ Đã chấm xong!"
@@ -332,123 +1742,744 @@ if st.button(
                     f"{ket_qua['tong_diem']}/10"
                 )
 
-                st.write(
-                    f"**Học sinh:** {ho_ten}"
-                )
-
-                st.write(
-                    f"**Lớp:** {lop}"
-                )
-
-                st.subheader(
-                    "📊 Chi tiết"
+                st.markdown(
+                    "### 📊 Chi tiết"
                 )
 
                 for tc in ket_qua[
                     "chi_tiet"
                 ]:
-
-                    if len(tc["sai"]) == 0:
-                        icon = "✅"
-                    else:
-                        icon = "⚠️"
-
-                    st.write(
-                        f"{icon} "
-                        f"**{tc['ten']}**: "
-                        f"{tc['diem']}/"
-                        f"{tc['diem_max']} điểm"
-                    )
-
-                    if tc["sai"]:
-
-                        st.caption(
-                            "Cần xem lại: "
-                            + ", ".join(
-                                tc["sai"]
-                            )
-                        )
-
-
-                # ================================
-                # NHẬN XÉT BẰNG GEMINI
-                # ================================
-
-                try:
-
-                    api_key = (
-                        st.secrets[
-                            "GEMINI_API_KEY"
-                        ]
-                    )
-
-                    client = genai.Client(
-                        api_key=api_key
-                    )
-
-                    prompt = f"""
-Bạn là giáo viên Tin học THCS.
-
-Học sinh:
-{ho_ten}
-
-Lớp:
-{lop}
-
-Kết quả chấm do Python xác định:
-{ket_qua}
-
-Điểm chính thức:
-{ket_qua['tong_diem']}/10
-
-QUY TẮC:
-
-1. Không được thay đổi điểm.
-2. Không giải hộ học sinh.
-3. Không viết sẵn công thức hoàn chỉnh.
-4. Chỉ rõ vị trí học sinh cần xem lại.
-5. Đặt câu hỏi gợi mở để học sinh tự sửa.
-6. Giọng văn thân thiện, khích lệ.
-7. Nhận xét ngắn gọn, phù hợp học sinh THCS.
-
-Trình bày:
-
-🌟 Điểm làm tốt
-
-🔍 Nội dung cần xem lại
-
-💡 Câu hỏi gợi ý
-"""
-
-                    response = (
-                        client.models
-                        .generate_content(
-                            model=(
-                                "gemini-3.8-flash"
-                            ),
-                            contents=prompt
-                        )
-                    )
-
-                    st.subheader(
-                        "🤖 Nhận xét của AI"
+                    icon = (
+                        "✅"
+                        if not tc["sai"]
+                        else "⚠️"
                     )
 
                     st.markdown(
-                        response.text
+                        f"{icon} "
+                        f"**{tc['mo_ta']}**"
                     )
 
-                except Exception:
-
-                    st.info(
-                        "Điểm đã được chấm. "
-                        "Hiện chưa tạo được "
-                        "nhận xét AI."
+                    st.write(
+                        f"{tc['diem']}/"
+                        f"{tc['diem_toi_da']} điểm"
                     )
 
-        except Exception as e:
+                    if tc["sai"]:
+                        vals = []
 
-            st.error(
-                "Không đọc được bài làm: "
-                + str(e)
+                        for x in tc["sai"][:20]:
+                            if isinstance(
+                                x,
+                                dict
+                            ):
+                                vals.append(
+                                    str(
+                                        x.get(
+                                            "o",
+                                            x
+                                        )
+                                    )
+                                )
+                            else:
+                                vals.append(
+                                    str(x)
+                                )
+
+                        st.caption(
+                            "Cần xem lại: "
+                            + ", ".join(vals)
+                        )
+
+                if nhan_xet:
+                    st.markdown(
+                        "### 🤖 Nhận xét sư phạm"
+                    )
+
+                    st.markdown(
+                        nhan_xet
+                    )
+
+
+# =========================================================
+# 15. GIÁO VIÊN - ĐĂNG NHẬP
+# =========================================================
+
+with tab_gv:
+    st.subheader(
+        "👩‍🏫 Khu vực giáo viên"
+    )
+
+    if "gv_login" not in st.session_state:
+        st.session_state[
+            "gv_login"
+        ] = False
+
+    if not st.session_state[
+        "gv_login"
+    ]:
+        pin = st.text_input(
+            "Mật khẩu giáo viên",
+            type="password"
+        )
+
+        if st.button(
+            "🔐 Đăng nhập"
+        ):
+            if (
+                TEACHER_PIN
+                and hmac.compare_digest(
+                    pin,
+                    TEACHER_PIN
+                )
+            ):
+                st.session_state[
+                    "gv_login"
+                ] = True
+
+                st.rerun()
+
+            else:
+                st.error(
+                    "Mật khẩu không đúng."
+                )
+
+    else:
+        if st.button(
+            "Đăng xuất"
+        ):
+            st.session_state[
+                "gv_login"
+            ] = False
+
+            st.rerun()
+
+        tao_tab, ql_tab = st.tabs([
+            "➕ Tạo bài",
+            "📊 Quản lý & kết quả"
+        ])
+
+
+        # =================================================
+        # 16. GIÁO VIÊN - TẠO BÀI
+        # =================================================
+
+        with tao_tab:
+            ten_bai = st.text_input(
+                "Tên bài",
+                value="Bài thực hành"
             )
+
+            mo_ta = st.text_area(
+                "Mô tả / yêu cầu chung"
+            )
+
+            loai_file = st.selectbox(
+                "Loại bài học sinh nộp",
+                [
+                    "Excel",
+                    "Word",
+                    "PowerPoint"
+                ]
+            )
+
+            # ---------------------------------------------
+            # EXCEL
+            # ---------------------------------------------
+            if loai_file == "Excel":
+                c1, c2 = st.columns(2)
+
+                with c1:
+                    ten_sheet = st.text_input(
+                        "Tên sheet cần chấm",
+                        placeholder=(
+                            "Để trống = "
+                            "sheet đầu tiên"
+                        )
+                    )
+
+                    cot_moc = st.text_input(
+                        "Cột xác định hàng dữ liệu",
+                        value="A"
+                    )
+
+                with c2:
+                    hang_bat_dau = (
+                        st.number_input(
+                            "Dữ liệu bắt đầu từ hàng",
+                            min_value=1,
+                            value=2,
+                            step=1
+                        )
+                    )
+
+                st.markdown(
+                    "### Barem Excel"
+                )
+
+                mac_dinh = pd.DataFrame([
+                    {
+                        "loai": "HAM_VUNG",
+                        "mo_ta":
+                            "Cột F dùng AVERAGE đúng vùng",
+                        "diem": 4.0,
+                        "cot_ket_qua": "F",
+                        "ten_ham": "AVERAGE",
+                        "cot_dau": "C",
+                        "cot_cuoi": "E",
+                        "hang": None,
+                        "cong_thuc_mau": None,
+                        "can_le": None,
+                        "dinh_dang_so": None
+                    },
+                    {
+                        "loai": "CONG_THUC_MAU",
+                        "mo_ta":
+                            "Cột G dùng IF đúng",
+                        "diem": 4.0,
+                        "cot_ket_qua": "G",
+                        "ten_ham": None,
+                        "cot_dau": None,
+                        "cot_cuoi": None,
+                        "hang": None,
+                        "cong_thuc_mau":
+                            '=IF(F{r}>=8,"Tốt","Đạt")',
+                        "can_le": None,
+                        "dinh_dang_so": None
+                    },
+                    {
+                        "loai": "IN_DAM_HANG",
+                        "mo_ta":
+                            "Hàng tiêu đề in đậm",
+                        "diem": 1.0,
+                        "cot_ket_qua": None,
+                        "ten_ham": None,
+                        "cot_dau": "A",
+                        "cot_cuoi": "G",
+                        "hang": 1,
+                        "cong_thuc_mau": None,
+                        "can_le": None,
+                        "dinh_dang_so": None
+                    },
+                    {
+                        "loai": "VIEN_BANG",
+                        "mo_ta":
+                            "Bảng có đường viền",
+                        "diem": 1.0,
+                        "cot_ket_qua": None,
+                        "ten_ham": None,
+                        "cot_dau": "A",
+                        "cot_cuoi": "G",
+                        "hang": 1,
+                        "cong_thuc_mau": None,
+                        "can_le": None,
+                        "dinh_dang_so": None
+                    }
+                ])
+
+                df = st.data_editor(
+                    mac_dinh,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "loai":
+                            st.column_config
+                            .SelectboxColumn(
+                                "Loại tiêu chí",
+                                options=[
+                                    "HAM_VUNG",
+                                    "CONG_THUC_MAU",
+                                    "IN_DAM_HANG",
+                                    "VIEN_BANG",
+                                    "CAN_LE_HANG",
+                                    "DINH_DANG_SO"
+                                ]
+                            ),
+
+                        "diem":
+                            st.column_config
+                            .NumberColumn(
+                                "Điểm",
+                                min_value=0.0,
+                                max_value=10.0,
+                                step=0.25
+                            )
+                    }
+                )
+
+                if st.button(
+                    "✅ Tạo bài Excel và sinh mã",
+                    type="primary"
+                ):
+                    try:
+                        barem = (
+                            tao_barem_excel(
+                                ten_bai,
+                                ten_sheet,
+                                cot_moc,
+                                hang_bat_dau,
+                                df
+                            )
+                        )
+
+                        ma = tao_bai_moi(
+                            ten_bai,
+                            mo_ta,
+                            "Excel",
+                            barem
+                        )
+
+                        st.success(
+                            "Đã tạo bài!"
+                        )
+                        st.code(ma)
+
+                    except Exception as e:
+                        st.error(str(e))
+
+            # ---------------------------------------------
+            # WORD
+            # ---------------------------------------------
+            elif loai_file == "Word":
+                st.markdown(
+                    "### Barem Word"
+                )
+
+                word_df = pd.DataFrame([
+                    {
+                        "loai": "CO_NOI_DUNG",
+                        "mo_ta":
+                            "Có đầy đủ nội dung bắt buộc",
+                        "diem": 2.0,
+                        "gia_tri":
+                            "Họ và tên|Lớp"
+                    },
+                    {
+                        "loai": "FONT",
+                        "mo_ta":
+                            "Font Times New Roman",
+                        "diem": 2.0,
+                        "gia_tri":
+                            "Times New Roman"
+                    },
+                    {
+                        "loai": "CO_CHU",
+                        "mo_ta":
+                            "Cỡ chữ 14",
+                        "diem": 2.0,
+                        "gia_tri": "14"
+                    },
+                    {
+                        "loai": "CAN_LE",
+                        "mo_ta":
+                            "Căn đều hai bên",
+                        "diem": 2.0,
+                        "gia_tri":
+                            "justify"
+                    },
+                    {
+                        "loai": "LE_TRANG",
+                        "mo_ta":
+                            "Lề 3-2-2-2 cm",
+                        "diem": 2.0,
+                        "gia_tri":
+                            "3,2,2,2"
+                    }
+                ])
+
+                df_word = st.data_editor(
+                    word_df,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "loai":
+                            st.column_config
+                            .SelectboxColumn(
+                                "Loại tiêu chí",
+                                options=[
+                                    "CO_NOI_DUNG",
+                                    "SO_DOAN_TOI_THIEU",
+                                    "SO_BANG_TOI_THIEU",
+                                    "IN_DAM",
+                                    "IN_NGHIENG",
+                                    "FONT",
+                                    "CO_CHU",
+                                    "CAN_LE",
+                                    "GIAN_DONG",
+                                    "LE_TRANG"
+                                ]
+                            ),
+
+                        "diem":
+                            st.column_config
+                            .NumberColumn(
+                                "Điểm",
+                                min_value=0.0,
+                                max_value=10.0,
+                                step=0.25
+                            ),
+
+                        "gia_tri":
+                            st.column_config
+                            .TextColumn(
+                                "Giá trị"
+                            )
+                    }
+                )
+
+                with st.expander(
+                    "📖 Cách nhập barem Word"
+                ):
+                    st.markdown(
+                        """
+- `CO_NOI_DUNG`: các cụm bắt buộc, ngăn bởi `|`
+- `SO_DOAN_TOI_THIEU`: ví dụ `5`
+- `SO_BANG_TOI_THIEU`: ví dụ `1`
+- `IN_DAM`: không cần giá trị
+- `IN_NGHIENG`: không cần giá trị
+- `FONT`: ví dụ `Times New Roman`
+- `CO_CHU`: ví dụ `14`
+- `CAN_LE`: `left`, `center`, `right`, `justify`
+- `GIAN_DONG`: ví dụ `1.5`
+- `LE_TRANG`: `trái,phải,trên,dưới`, ví dụ `3,2,2,2`
+                        """
+                    )
+
+                if st.button(
+                    "✅ Tạo bài Word và sinh mã",
+                    type="primary"
+                ):
+                    try:
+                        barem = (
+                            tao_barem_dang_gia_tri(
+                                ten_bai,
+                                df_word
+                            )
+                        )
+
+                        ma = tao_bai_moi(
+                            ten_bai,
+                            mo_ta,
+                            "Word",
+                            barem
+                        )
+
+                        st.success(
+                            "Đã tạo bài!"
+                        )
+                        st.code(ma)
+
+                    except Exception as e:
+                        st.error(str(e))
+
+            # ---------------------------------------------
+            # POWERPOINT
+            # ---------------------------------------------
+            else:
+                st.markdown(
+                    "### Barem PowerPoint"
+                )
+
+                ppt_df = pd.DataFrame([
+                    {
+                        "loai":
+                            "SO_SLIDE_TOI_THIEU",
+                        "mo_ta":
+                            "Có ít nhất 5 slide",
+                        "diem": 2.0,
+                        "gia_tri": "5"
+                    },
+                    {
+                        "loai":
+                            "TIEU_DE_SLIDE",
+                        "mo_ta":
+                            "Các slide có tiêu đề",
+                        "diem": 2.0,
+                        "gia_tri": ""
+                    },
+                    {
+                        "loai":
+                            "CO_NOI_DUNG",
+                        "mo_ta":
+                            "Có đủ nội dung bắt buộc",
+                        "diem": 2.0,
+                        "gia_tri":
+                            "Mở đầu|Nội dung|Kết luận"
+                    },
+                    {
+                        "loai":
+                            "SO_ANH_TOI_THIEU",
+                        "mo_ta":
+                            "Có ít nhất 2 hình ảnh",
+                        "diem": 2.0,
+                        "gia_tri": "2"
+                    },
+                    {
+                        "loai":
+                            "CO_CHU",
+                        "mo_ta":
+                            "Cỡ chữ 24",
+                        "diem": 2.0,
+                        "gia_tri": "24"
+                    }
+                ])
+
+                df_ppt = st.data_editor(
+                    ppt_df,
+                    num_rows="dynamic",
+                    use_container_width=True,
+                    column_config={
+                        "loai":
+                            st.column_config
+                            .SelectboxColumn(
+                                "Loại tiêu chí",
+                                options=[
+                                    "SO_SLIDE_TOI_THIEU",
+                                    "TIEU_DE_SLIDE",
+                                    "CO_NOI_DUNG",
+                                    "SO_ANH_TOI_THIEU",
+                                    "SO_BANG_TOI_THIEU",
+                                    "FONT",
+                                    "CO_CHU",
+                                    "IN_DAM",
+                                    "IN_NGHIENG",
+                                    "CAN_LE"
+                                ]
+                            ),
+
+                        "diem":
+                            st.column_config
+                            .NumberColumn(
+                                "Điểm",
+                                min_value=0.0,
+                                max_value=10.0,
+                                step=0.25
+                            ),
+
+                        "gia_tri":
+                            st.column_config
+                            .TextColumn(
+                                "Giá trị"
+                            )
+                    }
+                )
+
+                with st.expander(
+                    "📖 Cách nhập barem PowerPoint"
+                ):
+                    st.markdown(
+                        """
+- `SO_SLIDE_TOI_THIEU`: ví dụ `5`
+- `TIEU_DE_SLIDE`: kiểm tra mỗi slide có tiêu đề; không cần giá trị
+- `CO_NOI_DUNG`: các cụm bắt buộc, ngăn bởi `|`
+- `SO_ANH_TOI_THIEU`: ví dụ `2`
+- `SO_BANG_TOI_THIEU`: ví dụ `1`
+- `FONT`: ví dụ `Arial`
+- `CO_CHU`: ví dụ `24`
+- `IN_DAM`: không cần giá trị
+- `IN_NGHIENG`: không cần giá trị
+- `CAN_LE`: `left`, `center`, `right`, `justify`
+                        """
+                    )
+
+                if st.button(
+                    "✅ Tạo bài PowerPoint và sinh mã",
+                    type="primary"
+                ):
+                    try:
+                        barem = (
+                            tao_barem_dang_gia_tri(
+                                ten_bai,
+                                df_ppt
+                            )
+                        )
+
+                        ma = tao_bai_moi(
+                            ten_bai,
+                            mo_ta,
+                            "PowerPoint",
+                            barem
+                        )
+
+                        st.success(
+                            "Đã tạo bài!"
+                        )
+                        st.code(ma)
+
+                    except Exception as e:
+                        st.error(str(e))
+
+
+        # =================================================
+        # 17. QUẢN LÝ & KẾT QUẢ
+        # =================================================
+
+        with ql_tab:
+            ds = lay_danh_sach_bai()
+
+            if not ds:
+                st.info(
+                    "Chưa có bài."
+                )
+
+            else:
+                opts = {
+                    (
+                        f"{x['code']} — "
+                        f"{x['title']}"
+                    ): x
+                    for x in ds
+                }
+
+                key = st.selectbox(
+                    "Chọn bài",
+                    list(opts.keys())
+                )
+
+                bai = opts[key]
+
+                loai = (
+                    bai["rubric"]
+                    .get(
+                        "loai_file",
+                        "Excel"
+                    )
+                )
+
+                st.write(
+                    f"**Mã:** "
+                    f"`{bai['code']}`"
+                )
+
+                st.write(
+                    f"**Loại:** {loai}"
+                )
+
+                st.write(
+                    "**Trạng thái:** "
+                    + (
+                        "🟢 Đang mở"
+                        if bai["active"]
+                        else "🔴 Đã đóng"
+                    )
+                )
+
+                if bai["active"]:
+                    if st.button(
+                        "🔒 Đóng nhận bài"
+                    ):
+                        cap_nhat_trang_thai_bai(
+                            bai["code"],
+                            False
+                        )
+                        st.rerun()
+                else:
+                    if st.button(
+                        "🔓 Mở lại bài"
+                    ):
+                        cap_nhat_trang_thai_bai(
+                            bai["code"],
+                            True
+                        )
+                        st.rerun()
+
+                ds_kq = lay_ket_qua_bai(
+                    bai["code"]
+                )
+
+                if not ds_kq:
+                    st.info(
+                        "Chưa có học sinh "
+                        "nộp bài."
+                    )
+                else:
+                    bang = pd.DataFrame(
+                        ds_kq
+                    )
+
+                    hien = (
+                        bang[
+                            [
+                                "student_name",
+                                "class_name",
+                                "score",
+                                "file_name",
+                                "submitted_at"
+                            ]
+                        ]
+                        .rename(
+                            columns={
+                                "student_name":
+                                    "Họ và tên",
+
+                                "class_name":
+                                    "Lớp",
+
+                                "score":
+                                    "Điểm",
+
+                                "file_name":
+                                    "Tên file",
+
+                                "submitted_at":
+                                    "Thời gian nộp"
+                            }
+                        )
+                    )
+
+                    st.dataframe(
+                        hien,
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    c1, c2, c3 = st.columns(3)
+
+                    c1.metric(
+                        "Số lượt nộp",
+                        len(bang)
+                    )
+
+                    c2.metric(
+                        "Điểm TB",
+                        round(
+                            float(
+                                bang[
+                                    "score"
+                                ].mean()
+                            ),
+                            2
+                        )
+                    )
+
+                    c3.metric(
+                        "Điểm cao nhất",
+                        float(
+                            bang[
+                                "score"
+                            ].max()
+                        )
+                    )
+
+                    file_excel = (
+                        tao_file_excel_ket_qua(
+                            ds_kq
+                        )
+                    )
+
+                    if file_excel:
+                        st.download_button(
+                            "⬇️ Tải bảng điểm Excel",
+                            data=file_excel,
+                            file_name=(
+                                f"Ket_qua_"
+                                f"{bai['code']}.xlsx"
+                            ),
+                            mime=(
+                                "application/"
+                                "vnd.openxmlformats-"
+                                "officedocument."
+                                "spreadsheetml.sheet"
+                            )
+                        )
+
