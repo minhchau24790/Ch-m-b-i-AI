@@ -46,8 +46,8 @@ st.markdown(
 
 st.title("📝 AI SMART EVAL THCS")
 st.caption(
-    "Chấm bài thực hành Excel • Word • PowerPoint "
-    "theo barem giáo viên tự tạo trên web"
+    "Hệ thống hỗ trợ chấm bài thực hành Excel, Word, PowerPoint "
+    "theo barem giáo viên thiết lập và phản hồi sư phạm bằng AI"
 )
 
 
@@ -409,6 +409,71 @@ def cham_excel(file_bytes, barem):
                 else:
                     sai.append(cell.coordinate)
 
+        elif loai == "HAM_TRONG_COT":
+            ten_ham = tc["ten_ham"].strip().upper()
+            mau = re.compile(r"\\b" + re.escape(ten_ham) + r"\\s*\\(")
+
+            for r in hang_dl:
+                cell = sh[f"{tc['cot_ket_qua']}{r}"]
+                cong_thuc = chuan_hoa_cong_thuc(cell.value)
+
+                if (
+                    cong_thuc.startswith("=")
+                    and mau.search(cong_thuc)
+                ):
+                    dung.append(cell.coordinate)
+                else:
+                    sai.append({
+                        "o": cell.coordinate,
+                        "hien_tai": cell.value
+                    })
+
+        elif loai == "SO_BIEU_DO_TOI_THIEU":
+            so = len(getattr(sh, "_charts", []))
+            dat = so >= int(tc["gia_tri"])
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có {so} biểu đồ.",
+                    f"Hiện có {so} biểu đồ."
+                )
+            )
+            continue
+
+        elif loai == "CO_XAC_THUC_DU_LIEU":
+            try:
+                so = len(sh.data_validations.dataValidation)
+            except Exception:
+                so = 0
+
+            dat = so >= int(tc.get("gia_tri", 1) or 1)
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có {so} quy tắc xác thực dữ liệu.",
+                    f"Hiện có {so} quy tắc xác thực dữ liệu."
+                )
+            )
+            continue
+
+        elif loai == "CO_BO_LOC":
+            ref = getattr(sh.auto_filter, "ref", None)
+            dat = bool(ref)
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có vùng bộ lọc: {ref}.",
+                    "Chưa phát hiện vùng bộ lọc."
+                )
+            )
+            continue
+
         else:
             continue
 
@@ -695,6 +760,80 @@ def cham_word(file_bytes, barem):
                     sai.append(
                         f"Section {i}"
                     )
+
+        elif loai == "SO_ANH_TOI_THIEU":
+            so = len(doc.inline_shapes)
+            dat = so >= int(tc["gia_tri"])
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có {so} hình ảnh.",
+                    f"Hiện có {so} hình ảnh."
+                )
+            )
+            continue
+
+        elif loai == "DAU_TRANG_CHAN_TRANG":
+            co_noi_dung = False
+
+            for sec in doc.sections:
+                header_text = "\n".join(
+                    p.text.strip()
+                    for p in sec.header.paragraphs
+                    if p.text.strip()
+                )
+                footer_text = "\n".join(
+                    p.text.strip()
+                    for p in sec.footer.paragraphs
+                    if p.text.strip()
+                )
+
+                if header_text or footer_text:
+                    co_noi_dung = True
+                    break
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    co_noi_dung,
+                    "Có đầu trang hoặc chân trang.",
+                    "Chưa phát hiện đầu trang/chân trang có nội dung."
+                )
+            )
+            continue
+
+        elif loai == "DANH_SACH_LIET_KE":
+            so = 0
+
+            for _, p in ds_doan:
+                try:
+                    pPr = p._p.pPr
+                    if pPr is not None and pPr.numPr is not None:
+                        so += 1
+                        continue
+                except Exception:
+                    pass
+
+                try:
+                    style_name = p.style.name or ""
+                    if "List" in style_name:
+                        so += 1
+                except Exception:
+                    pass
+
+            dat = so >= int(tc.get("gia_tri", 1) or 1)
+
+            kq.append(
+                ket_qua_dat_khong(
+                    tc,
+                    dat,
+                    f"Có {so} đoạn danh sách.",
+                    f"Hiện phát hiện {so} đoạn danh sách."
+                )
+            )
+            continue
 
         else:
             continue
@@ -1374,6 +1513,32 @@ def tao_barem_excel(
                     )
             })
 
+        elif loai == "HAM_TRONG_COT":
+            tc.update({
+                "cot_ket_qua":
+                    str(
+                        row.get(
+                            "cot_ket_qua"
+                        ) or ""
+                    ).upper(),
+
+                "ten_ham":
+                    str(
+                        row.get(
+                            "ten_ham"
+                        ) or ""
+                    ).upper()
+            })
+
+        elif loai in (
+            "SO_BIEU_DO_TOI_THIEU",
+            "CO_XAC_THUC_DU_LIEU",
+            "CO_BO_LOC"
+        ):
+            tc["gia_tri"] = str(
+                row.get("gia_tri") or "1"
+            )
+
         tieu_chi.append(tc)
 
     kiem_tra_tong_diem(
@@ -1516,6 +1681,575 @@ def tao_file_excel_ket_qua(ds):
 
     out.seek(0)
     return out.getvalue()
+
+
+
+# =========================================================
+# 11B. BAREM GỢI Ý THEO CTGDPT 2018 / SGK KẾT NỐI TRI THỨC
+# =========================================================
+
+def df_excel(rows):
+    cot = [
+        "loai", "mo_ta", "diem", "cot_ket_qua",
+        "ten_ham", "cot_dau", "cot_cuoi", "hang",
+        "cong_thuc_mau", "can_le", "dinh_dang_so",
+        "gia_tri"
+    ]
+    return pd.DataFrame(rows, columns=cot)
+
+
+def df_gia_tri(rows):
+    return pd.DataFrame(
+        rows,
+        columns=["loai", "mo_ta", "diem", "gia_tri"]
+    )
+
+
+BAREM_CHUAN_EXCEL = {
+    "Lớp 7 – Bảng tính cơ bản, công thức và hàm": [
+        {
+            "loai": "HAM_TRONG_COT",
+            "mo_ta": "Sử dụng công thức/hàm tính toán đúng yêu cầu",
+            "diem": 4.0,
+            "cot_ket_qua": "F",
+            "ten_ham": "AVERAGE"
+        },
+        {
+            "loai": "DINH_DANG_SO",
+            "mo_ta": "Định dạng dữ liệu số phù hợp",
+            "diem": 2.0,
+            "cot_ket_qua": "F",
+            "dinh_dang_so": "0.00"
+        },
+        {
+            "loai": "IN_DAM_HANG",
+            "mo_ta": "Hàng tiêu đề được định dạng nổi bật",
+            "diem": 2.0,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Bảng dữ liệu được kẻ viền đầy đủ",
+            "diem": 2.0,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        }
+    ],
+
+    "Lớp 7 – Hoàn thiện bảng tính": [
+        {
+            "loai": "HAM_TRONG_COT",
+            "mo_ta": "Công thức/hàm tính toán đúng",
+            "diem": 4.0,
+            "cot_ket_qua": "F",
+            "ten_ham": "AVERAGE"
+        },
+        {
+            "loai": "DINH_DANG_SO",
+            "mo_ta": "Định dạng số đúng yêu cầu",
+            "diem": 2.0,
+            "cot_ket_qua": "F",
+            "dinh_dang_so": "0.00"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Kẻ khung vùng dữ liệu",
+            "diem": 2.0,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        },
+        {
+            "loai": "IN_DAM_HANG",
+            "mo_ta": "Tiêu đề bảng rõ ràng, nổi bật",
+            "diem": 2.0,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        }
+    ],
+
+    "Lớp 8 – Sử dụng bảng tính giải quyết bài toán thực tế": [
+        {
+            "loai": "HAM_TRONG_COT",
+            "mo_ta": "Sử dụng công thức/hàm phù hợp để giải quyết bài toán",
+            "diem": 5.0,
+            "cot_ket_qua": "F",
+            "ten_ham": "SUM"
+        },
+        {
+            "loai": "DINH_DANG_SO",
+            "mo_ta": "Định dạng số/dữ liệu phù hợp",
+            "diem": 2.0,
+            "cot_ket_qua": "F",
+            "dinh_dang_so": "#,##0"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Trình bày bảng rõ ràng, có đường viền",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        },
+        {
+            "loai": "IN_DAM_HANG",
+            "mo_ta": "Tiêu đề bảng được định dạng phù hợp",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        }
+    ],
+
+    "Lớp 8 – Sắp xếp và lọc dữ liệu": [
+        {
+            "loai": "CO_BO_LOC",
+            "mo_ta": "Thiết lập bộ lọc cho vùng dữ liệu",
+            "diem": 5.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Bảng dữ liệu được trình bày rõ ràng",
+            "diem": 2.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        },
+        {
+            "loai": "IN_DAM_HANG",
+            "mo_ta": "Hàng tiêu đề rõ ràng",
+            "diem": 2.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        }
+    ],
+
+    "Lớp 8 – Trình bày dữ liệu bằng biểu đồ": [
+        {
+            "loai": "SO_BIEU_DO_TOI_THIEU",
+            "mo_ta": "Tạo được biểu đồ biểu diễn dữ liệu",
+            "diem": 6.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Nguồn dữ liệu được trình bày rõ ràng",
+            "diem": 2.0,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        },
+        {
+            "loai": "IN_DAM_HANG",
+            "mo_ta": "Tiêu đề nguồn dữ liệu được làm nổi bật",
+            "diem": 2.0,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        }
+    ],
+
+    "Lớp 9 – Sử dụng công cụ xác thực dữ liệu": [
+        {
+            "loai": "CO_XAC_THUC_DU_LIEU",
+            "mo_ta": "Thiết lập xác thực dữ liệu theo yêu cầu",
+            "diem": 7.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Bảng dữ liệu được trình bày rõ ràng",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        },
+        {
+            "loai": "IN_DAM_HANG",
+            "mo_ta": "Hàng tiêu đề được định dạng phù hợp",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        }
+    ],
+
+    "Lớp 9 – Hàm COUNTIF": [
+        {
+            "loai": "HAM_TRONG_COT",
+            "mo_ta": "Sử dụng đúng hàm COUNTIF",
+            "diem": 7.0,
+            "cot_ket_qua": "F",
+            "ten_ham": "COUNTIF"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Bảng trình bày rõ ràng",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        },
+        {
+            "loai": "IN_DAM_HANG",
+            "mo_ta": "Tiêu đề bảng phù hợp",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        }
+    ],
+
+    "Lớp 9 – Hàm SUMIF": [
+        {
+            "loai": "HAM_TRONG_COT",
+            "mo_ta": "Sử dụng đúng hàm SUMIF",
+            "diem": 7.0,
+            "cot_ket_qua": "F",
+            "ten_ham": "SUMIF"
+        },
+        {
+            "loai": "DINH_DANG_SO",
+            "mo_ta": "Định dạng số phù hợp",
+            "diem": 1.5,
+            "cot_ket_qua": "F",
+            "dinh_dang_so": "#,##0"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Bảng trình bày rõ ràng",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "F"
+        }
+    ],
+
+    "Lớp 9 – Hàm IF": [
+        {
+            "loai": "HAM_TRONG_COT",
+            "mo_ta": "Sử dụng đúng hàm IF",
+            "diem": 7.0,
+            "cot_ket_qua": "G",
+            "ten_ham": "IF"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Bảng trình bày rõ ràng",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "G"
+        },
+        {
+            "loai": "IN_DAM_HANG",
+            "mo_ta": "Tiêu đề bảng phù hợp",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "G"
+        }
+    ],
+
+    "Lớp 9 – Hoàn thiện bảng tính quản lí tài chính": [
+        {
+            "loai": "HAM_TRONG_COT",
+            "mo_ta": "Sử dụng hàm điều kiện/thống kê đúng yêu cầu",
+            "diem": 5.0,
+            "cot_ket_qua": "F",
+            "ten_ham": "SUMIF"
+        },
+        {
+            "loai": "CO_XAC_THUC_DU_LIEU",
+            "mo_ta": "Có xác thực dữ liệu ở vùng cần nhập",
+            "diem": 2.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "DINH_DANG_SO",
+            "mo_ta": "Định dạng tiền tệ/số phù hợp",
+            "diem": 1.5,
+            "cot_ket_qua": "F",
+            "dinh_dang_so": "#,##0"
+        },
+        {
+            "loai": "VIEN_BANG",
+            "mo_ta": "Bảng quản lí được trình bày rõ ràng",
+            "diem": 1.5,
+            "hang": 1,
+            "cot_dau": "A",
+            "cot_cuoi": "G"
+        }
+    ]
+}
+
+
+BAREM_CHUAN_WORD = {
+    "Lớp 6 – Định dạng văn bản": [
+        {
+            "loai": "FONT",
+            "mo_ta": "Sử dụng font chữ theo yêu cầu",
+            "diem": 2.0,
+            "gia_tri": "Times New Roman"
+        },
+        {
+            "loai": "CO_CHU",
+            "mo_ta": "Cỡ chữ phù hợp yêu cầu",
+            "diem": 2.0,
+            "gia_tri": "14"
+        },
+        {
+            "loai": "CAN_LE",
+            "mo_ta": "Căn lề đoạn văn phù hợp",
+            "diem": 2.0,
+            "gia_tri": "justify"
+        },
+        {
+            "loai": "IN_DAM",
+            "mo_ta": "Thực hiện định dạng chữ đậm ở nội dung yêu cầu",
+            "diem": 2.0,
+            "gia_tri": ""
+        },
+        {
+            "loai": "CO_NOI_DUNG",
+            "mo_ta": "Có đầy đủ nội dung bắt buộc",
+            "diem": 2.0,
+            "gia_tri": "Họ và tên|Lớp"
+        }
+    ],
+
+    "Lớp 6 – Trình bày thông tin ở dạng bảng": [
+        {
+            "loai": "SO_BANG_TOI_THIEU",
+            "mo_ta": "Tạo được bảng để trình bày thông tin",
+            "diem": 5.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "CO_NOI_DUNG",
+            "mo_ta": "Bảng có nội dung theo yêu cầu",
+            "diem": 2.0,
+            "gia_tri": "Họ và tên|Lớp"
+        },
+        {
+            "loai": "FONT",
+            "mo_ta": "Font chữ thống nhất, dễ đọc",
+            "diem": 1.5,
+            "gia_tri": "Times New Roman"
+        },
+        {
+            "loai": "CO_CHU",
+            "mo_ta": "Cỡ chữ phù hợp",
+            "diem": 1.5,
+            "gia_tri": "14"
+        }
+    ],
+
+    "Lớp 6 – Thực hành tổng hợp: Sổ lưu niệm": [
+        {
+            "loai": "CO_NOI_DUNG",
+            "mo_ta": "Có các nội dung chính của sản phẩm",
+            "diem": 3.0,
+            "gia_tri": "Họ và tên|Lớp"
+        },
+        {
+            "loai": "SO_BANG_TOI_THIEU",
+            "mo_ta": "Có bảng trình bày thông tin",
+            "diem": 2.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "SO_ANH_TOI_THIEU",
+            "mo_ta": "Có hình ảnh minh hoạ",
+            "diem": 2.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "FONT",
+            "mo_ta": "Định dạng font chữ thống nhất",
+            "diem": 1.5,
+            "gia_tri": "Times New Roman"
+        },
+        {
+            "loai": "CAN_LE",
+            "mo_ta": "Căn lề đoạn văn phù hợp",
+            "diem": 1.5,
+            "gia_tri": "justify"
+        }
+    ],
+
+    "Lớp 8 – Danh sách liệt kê và hình ảnh trong văn bản": [
+        {
+            "loai": "DANH_SACH_LIET_KE",
+            "mo_ta": "Tạo được danh sách dạng liệt kê",
+            "diem": 4.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "SO_ANH_TOI_THIEU",
+            "mo_ta": "Chèn được hình ảnh minh hoạ",
+            "diem": 3.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "CO_NOI_DUNG",
+            "mo_ta": "Nội dung văn bản đầy đủ",
+            "diem": 2.0,
+            "gia_tri": "Họ và tên|Lớp"
+        },
+        {
+            "loai": "CAN_LE",
+            "mo_ta": "Trình bày đoạn văn hợp lí",
+            "diem": 1.0,
+            "gia_tri": "justify"
+        }
+    ],
+
+    "Lớp 8 – Tạo đầu trang, chân trang": [
+        {
+            "loai": "DAU_TRANG_CHAN_TRANG",
+            "mo_ta": "Tạo được đầu trang hoặc chân trang",
+            "diem": 6.0,
+            "gia_tri": ""
+        },
+        {
+            "loai": "FONT",
+            "mo_ta": "Font chữ phù hợp, thống nhất",
+            "diem": 2.0,
+            "gia_tri": "Times New Roman"
+        },
+        {
+            "loai": "CAN_LE",
+            "mo_ta": "Nội dung văn bản trình bày hợp lí",
+            "diem": 2.0,
+            "gia_tri": "justify"
+        }
+    ]
+}
+
+
+BAREM_CHUAN_PPT = {
+    "Lớp 8 – Định dạng nâng cao cho trang chiếu": [
+        {
+            "loai": "SO_SLIDE_TOI_THIEU",
+            "mo_ta": "Có đủ số trang chiếu theo yêu cầu",
+            "diem": 2.0,
+            "gia_tri": "4"
+        },
+        {
+            "loai": "TIEU_DE_SLIDE",
+            "mo_ta": "Các trang chiếu có tiêu đề rõ ràng",
+            "diem": 2.0,
+            "gia_tri": ""
+        },
+        {
+            "loai": "CO_NOI_DUNG",
+            "mo_ta": "Nội dung chính đầy đủ, ngắn gọn",
+            "diem": 2.0,
+            "gia_tri": "Mở đầu|Nội dung|Kết luận"
+        },
+        {
+            "loai": "SO_ANH_TOI_THIEU",
+            "mo_ta": "Có hình ảnh minh hoạ",
+            "diem": 2.0,
+            "gia_tri": "1"
+        },
+        {
+            "loai": "CO_CHU",
+            "mo_ta": "Cỡ chữ đủ lớn để trình chiếu",
+            "diem": 2.0,
+            "gia_tri": "24"
+        }
+    ],
+
+    "Lớp 8 – Sử dụng bản mẫu tạo bài trình chiếu": [
+        {
+            "loai": "SO_SLIDE_TOI_THIEU",
+            "mo_ta": "Tạo được bài trình chiếu đủ số slide",
+            "diem": 2.0,
+            "gia_tri": "5"
+        },
+        {
+            "loai": "TIEU_DE_SLIDE",
+            "mo_ta": "Các slide có tiêu đề",
+            "diem": 2.0,
+            "gia_tri": ""
+        },
+        {
+            "loai": "CO_NOI_DUNG",
+            "mo_ta": "Nội dung phục vụ học tập/giao lưu đầy đủ",
+            "diem": 2.0,
+            "gia_tri": "Mở đầu|Nội dung|Kết luận"
+        },
+        {
+            "loai": "SO_ANH_TOI_THIEU",
+            "mo_ta": "Có hình ảnh minh hoạ phù hợp",
+            "diem": 2.0,
+            "gia_tri": "2"
+        },
+        {
+            "loai": "CO_CHU",
+            "mo_ta": "Văn bản trên slide có cỡ chữ dễ đọc",
+            "diem": 2.0,
+            "gia_tri": "24"
+        }
+    ],
+
+    "Mẫu chung – Bài trình chiếu THCS": [
+        {
+            "loai": "SO_SLIDE_TOI_THIEU",
+            "mo_ta": "Đủ số slide tối thiểu",
+            "diem": 2.0,
+            "gia_tri": "5"
+        },
+        {
+            "loai": "TIEU_DE_SLIDE",
+            "mo_ta": "Mỗi slide có tiêu đề khi phù hợp",
+            "diem": 2.0,
+            "gia_tri": ""
+        },
+        {
+            "loai": "CO_NOI_DUNG",
+            "mo_ta": "Có đủ nội dung bắt buộc",
+            "diem": 2.0,
+            "gia_tri": "Mở đầu|Nội dung|Kết luận"
+        },
+        {
+            "loai": "SO_ANH_TOI_THIEU",
+            "mo_ta": "Có hình ảnh minh hoạ",
+            "diem": 2.0,
+            "gia_tri": "2"
+        },
+        {
+            "loai": "CO_CHU",
+            "mo_ta": "Cỡ chữ dễ quan sát",
+            "diem": 2.0,
+            "gia_tri": "24"
+        }
+    ]
+}
+
+
+def lay_barem_goi_y(loai_file, ten_mau):
+    if loai_file == "Excel":
+        return df_excel(
+            BAREM_CHUAN_EXCEL[ten_mau]
+        )
+
+    if loai_file == "Word":
+        return df_gia_tri(
+            BAREM_CHUAN_WORD[ten_mau]
+        )
+
+    return df_gia_tri(
+        BAREM_CHUAN_PPT[ten_mau]
+    )
 
 
 # =========================================================
@@ -1883,6 +2617,12 @@ with tab_gv:
                 ]
             )
 
+            st.info(
+                "Barem chuẩn gợi ý được xây dựng theo yêu cầu cần đạt CTGDPT 2018 "
+                "và mạch bài thực hành SGK Tin học THCS (tham chiếu Kết nối tri thức). "
+                "Giáo viên được phép chỉnh lại theo đúng đề giao cho học sinh."
+            )
+
             # ---------------------------------------------
             # EXCEL
             # ---------------------------------------------
@@ -1917,65 +2657,21 @@ with tab_gv:
                     "### Barem Excel"
                 )
 
-                mac_dinh = pd.DataFrame([
-                    {
-                        "loai": "HAM_VUNG",
-                        "mo_ta":
-                            "Cột F dùng AVERAGE đúng vùng",
-                        "diem": 4.0,
-                        "cot_ket_qua": "F",
-                        "ten_ham": "AVERAGE",
-                        "cot_dau": "C",
-                        "cot_cuoi": "E",
-                        "hang": None,
-                        "cong_thuc_mau": None,
-                        "can_le": None,
-                        "dinh_dang_so": None
-                    },
-                    {
-                        "loai": "CONG_THUC_MAU",
-                        "mo_ta":
-                            "Cột G dùng IF đúng",
-                        "diem": 4.0,
-                        "cot_ket_qua": "G",
-                        "ten_ham": None,
-                        "cot_dau": None,
-                        "cot_cuoi": None,
-                        "hang": None,
-                        "cong_thuc_mau":
-                            '=IF(F{r}>=8,"Tốt","Đạt")',
-                        "can_le": None,
-                        "dinh_dang_so": None
-                    },
-                    {
-                        "loai": "IN_DAM_HANG",
-                        "mo_ta":
-                            "Hàng tiêu đề in đậm",
-                        "diem": 1.0,
-                        "cot_ket_qua": None,
-                        "ten_ham": None,
-                        "cot_dau": "A",
-                        "cot_cuoi": "G",
-                        "hang": 1,
-                        "cong_thuc_mau": None,
-                        "can_le": None,
-                        "dinh_dang_so": None
-                    },
-                    {
-                        "loai": "VIEN_BANG",
-                        "mo_ta":
-                            "Bảng có đường viền",
-                        "diem": 1.0,
-                        "cot_ket_qua": None,
-                        "ten_ham": None,
-                        "cot_dau": "A",
-                        "cot_cuoi": "G",
-                        "hang": 1,
-                        "cong_thuc_mau": None,
-                        "can_le": None,
-                        "dinh_dang_so": None
-                    }
-                ])
+                mau_excel = st.selectbox(
+                    "Barem chuẩn gợi ý",
+                    list(BAREM_CHUAN_EXCEL.keys()),
+                    key="mau_excel"
+                )
+
+                st.caption(
+                    "Barem được nạp theo yêu cầu cần đạt gợi ý. "
+                    "Cô có thể sửa cột, vùng dữ liệu, hàm và điểm trước khi tạo bài."
+                )
+
+                mac_dinh = lay_barem_goi_y(
+                    "Excel",
+                    mau_excel
+                )
 
                 df = st.data_editor(
                     mac_dinh,
@@ -1992,7 +2688,11 @@ with tab_gv:
                                     "IN_DAM_HANG",
                                     "VIEN_BANG",
                                     "CAN_LE_HANG",
-                                    "DINH_DANG_SO"
+                                    "DINH_DANG_SO",
+                                    "HAM_TRONG_COT",
+                                    "SO_BIEU_DO_TOI_THIEU",
+                                    "CO_XAC_THUC_DU_LIEU",
+                                    "CO_BO_LOC"
                                 ]
                             ),
 
@@ -2045,47 +2745,21 @@ with tab_gv:
                     "### Barem Word"
                 )
 
-                word_df = pd.DataFrame([
-                    {
-                        "loai": "CO_NOI_DUNG",
-                        "mo_ta":
-                            "Có đầy đủ nội dung bắt buộc",
-                        "diem": 2.0,
-                        "gia_tri":
-                            "Họ và tên|Lớp"
-                    },
-                    {
-                        "loai": "FONT",
-                        "mo_ta":
-                            "Font Times New Roman",
-                        "diem": 2.0,
-                        "gia_tri":
-                            "Times New Roman"
-                    },
-                    {
-                        "loai": "CO_CHU",
-                        "mo_ta":
-                            "Cỡ chữ 14",
-                        "diem": 2.0,
-                        "gia_tri": "14"
-                    },
-                    {
-                        "loai": "CAN_LE",
-                        "mo_ta":
-                            "Căn đều hai bên",
-                        "diem": 2.0,
-                        "gia_tri":
-                            "justify"
-                    },
-                    {
-                        "loai": "LE_TRANG",
-                        "mo_ta":
-                            "Lề 3-2-2-2 cm",
-                        "diem": 2.0,
-                        "gia_tri":
-                            "3,2,2,2"
-                    }
-                ])
+                mau_word = st.selectbox(
+                    "Barem chuẩn gợi ý",
+                    list(BAREM_CHUAN_WORD.keys()),
+                    key="mau_word"
+                )
+
+                st.caption(
+                    "Barem gợi ý bám yêu cầu thực hành soạn thảo văn bản. "
+                    "Cô vẫn có thể chỉnh từng tiêu chí và điểm."
+                )
+
+                word_df = lay_barem_goi_y(
+                    "Word",
+                    mau_word
+                )
 
                 df_word = st.data_editor(
                     word_df,
@@ -2106,7 +2780,10 @@ with tab_gv:
                                     "CO_CHU",
                                     "CAN_LE",
                                     "GIAN_DONG",
-                                    "LE_TRANG"
+                                    "LE_TRANG",
+                                    "SO_ANH_TOI_THIEU",
+                                    "DAU_TRANG_CHAN_TRANG",
+                                    "DANH_SACH_LIET_KE"
                                 ]
                             ),
 
@@ -2141,7 +2818,7 @@ with tab_gv:
 - `CO_CHU`: ví dụ `14`
 - `CAN_LE`: `left`, `center`, `right`, `justify`
 - `GIAN_DONG`: ví dụ `1.5`
-- `LE_TRANG`: `trái,phải,trên,dưới`, ví dụ `3,2,2,2`
+- `LE_TRANG`: `trái,phải,trên,dưới`, ví dụ `3,2,2,2`\n- `SO_ANH_TOI_THIEU`: số ảnh tối thiểu\n- `DAU_TRANG_CHAN_TRANG`: kiểm tra có header/footer\n- `DANH_SACH_LIET_KE`: số đoạn danh sách tối thiểu
                         """
                     )
 
@@ -2180,49 +2857,21 @@ with tab_gv:
                     "### Barem PowerPoint"
                 )
 
-                ppt_df = pd.DataFrame([
-                    {
-                        "loai":
-                            "SO_SLIDE_TOI_THIEU",
-                        "mo_ta":
-                            "Có ít nhất 5 slide",
-                        "diem": 2.0,
-                        "gia_tri": "5"
-                    },
-                    {
-                        "loai":
-                            "TIEU_DE_SLIDE",
-                        "mo_ta":
-                            "Các slide có tiêu đề",
-                        "diem": 2.0,
-                        "gia_tri": ""
-                    },
-                    {
-                        "loai":
-                            "CO_NOI_DUNG",
-                        "mo_ta":
-                            "Có đủ nội dung bắt buộc",
-                        "diem": 2.0,
-                        "gia_tri":
-                            "Mở đầu|Nội dung|Kết luận"
-                    },
-                    {
-                        "loai":
-                            "SO_ANH_TOI_THIEU",
-                        "mo_ta":
-                            "Có ít nhất 2 hình ảnh",
-                        "diem": 2.0,
-                        "gia_tri": "2"
-                    },
-                    {
-                        "loai":
-                            "CO_CHU",
-                        "mo_ta":
-                            "Cỡ chữ 24",
-                        "diem": 2.0,
-                        "gia_tri": "24"
-                    }
-                ])
+                mau_ppt = st.selectbox(
+                    "Barem chuẩn gợi ý",
+                    list(BAREM_CHUAN_PPT.keys()),
+                    key="mau_ppt"
+                )
+
+                st.caption(
+                    "Barem gợi ý ưu tiên các yêu cầu Python có thể kiểm tra chắc chắn. "
+                    "Các tiêu chí thẩm mỹ/phối màu cô có thể bổ sung khi chấm trực tiếp."
+                )
+
+                ppt_df = lay_barem_goi_y(
+                    "PowerPoint",
+                    mau_ppt
+                )
 
                 df_ppt = st.data_editor(
                     ppt_df,
